@@ -1,0 +1,52 @@
+# DECODER-SC — Quick Usage Guide
+
+This file provides a minimal guide for running the DECODER-SC algorithm.
+
+## Requirements
+- R (>= 4.2)
+- Seurat
+- AUCell
+- DoRothEA regulons
+
+## Step 1: Prepare input data
+DECODER-SC requires a processed Seurat object saved as an `.rds` file.
+
+```r
+library(Seurat)
+
+seurat_obj <- CreateSeuratObject(counts = expression_matrix)
+seurat_obj <- NormalizeData(seurat_obj)
+seurat_obj <- FindVariableFeatures(seurat_obj)
+seurat_obj <- ScaleData(seurat_obj)
+saveRDS(seurat_obj, file = "input_seurat_object.rds")
+```
+
+## Step 2: Set working directory
+Place the `.rds` file in your working directory or set the path explicitly.
+
+```r
+setwd("path/to/DECODER-SC")
+seurat_obj <- readRDS("input_seurat_object.rds")
+```
+
+## Step 3: Run DECODER-SC
+Load the DECODER-SC functions and execute the algorithm.
+
+```r
+source("R/decoder_sc.R")
+
+results <- run_DECODER_SC(
+  seurat_object = seurat_obj,
+  regulons = dorothea_regulons,
+  activity_quantile = 0.7,
+  expression_quantile = 0.7
+)
+```
+
+## Output
+The `results` object contains:
+- TF failure scores
+- TF–gene failure and escape matrices
+- Cell-level regulatory violation scores
+
+These outputs can be directly used for visualization or downstream analyses.
