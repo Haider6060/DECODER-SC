@@ -1,0 +1,276 @@
+# ============================================================
+# SIMULATION ANALYSIS — COMPLETE REPRODUCIBLE CODE
+# ============================================================
+
+setwd("D:/Genomics/New Method")
+
+library(Seurat)
+library(AUCell)
+library(dplyr)
+library(dorothea)
+library(ggplot2)
+library(patchwork)
+
+# ------------------------------------------------------------
+# 1. Define run_decoder_validation function
+# ------------------------------------------------------------
+
+run_decoder_validation <- function(obj) {
+  
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- FindVariableFeatures(obj, verbose = FALSE)
+  obj <- ScaleData(obj, verbose = FALSE)
+  obj <- RunPCA(obj, verbose = FALSE)
+  obj <- FindNeighbors(obj, dims = 1:20, verbose = FALSE)
+  obj <- FindClusters(obj, resolution = 0.5, verbose = FALSE)
+  
+  Idents(obj) <- obj$seurat_clusters
+  
+  avg_expr <- AverageExpression(obj, layer = "scale.data")[[1]]
+  
+  data("dorothea_hs", package = "dorothea")
+  
+  regulons_df <- dorothea_hs[
+    dorothea_hs$confidence %in% c("A", "B", "C"),
+  ]
+  
+  regulons <- split(regulons_df$target, regulons_df$tf)
+  
+  rankings <- AUCell_buildRankings(avg_expr, plotStats = FALSE)
+  
+  tf_activity <- AUCell_calcAUC(regulons, rankings)
+  
+  tf_activity_mat <- as.matrix(getAUC(tf_activity))
+  
+  common_genes <- intersect(rownames(avg_expr), regulons_df$target)
+  
+  state_expr <- avg_expr[common_genes, , drop = FALSE]
+  
+  rules <- regulons_df[regulons_df$target %in% common_genes, ]
+  rules$gene <- rules$target
+  
+  q <- 0.75
+  
+  tf_state <- tf_activity_mat > apply(tf_activity_mat, 1, quantile, probs = q)
+  gene_state <- state_expr > apply(state_expr, 1, quantile, probs = q)
+  gene_z <- t(scale(t(state_expr)))
+  
+  discordance_mat <- matrix(0, nrow = nrow(rules), ncol = ncol(state_expr))
+  
+  for (i in seq_len(nrow(rules))) {
+    
+    tf  <- rules$tf[i]
+    tg  <- rules$target[i]
+    mor <- rules$mor[i]
+    
+    if (tf %in% rownames(tf_state)) {
+      
+      tf_on   <- tf_state[tf, ]
+      gene_on <- gene_state[tg, ]
+      
+      if (mor == 1) {
+        observed <- ifelse(tf_on & !gene_on, abs(gene_z[tg, ]), 0)
+        expected <- mean(tf_on) * mean(!gene_on)
+        discordance_mat[i, ] <- pmax(observed - expected, 0)
+      }
+      
+      if (mor == -1) {
+        observed <- ifelse(tf_on & gene_on, abs(gene_z[tg, ]), 0)
+        expected <- mean(tf_on) * mean(gene_on)
+        discordance_mat[i, ] <- pmax(observed - expected, 0)
+      }
+    }
+  }
+  
+  rules$discordance_score <- rowMeans(discordance_mat)
+  
+  tf_summary <- aggregate(discordance_score ~ tf, rules, mean)
+  tf_summary <- tf_summary[order(-tf_summary$discordance_score), ]
+  
+  return(tf_summary)
+}
+
+# ------------------------------------------------------------
+# 2. Load dataset and create 20,000-cell subset
+# ------------------------------------------------------------
+
+seu <- readRDS("GSE185204_lung cancer_dataset.rds")
+
+set.seed(123)
+cells_use <- sample(colnames(seu), 20000)
+
+sim_seu <- subset(seu, cells = cells_use)
+
+DefaultAssay(sim_seu) <- "RNA"
+sim_seu <- JoinLayers(sim_seu)
+
+# ------------------------------------------------------------
+# 3. Define simulated TFs
+# ------------------------------------------------------------
+
+simulated_tfs <- c("TBX21", "BACH1", "MAFB", "RUNX3", "PPARA")
+
+# ------------------------------------------------------------
+# 4. Original (unperturbed) TF scores
+# ------------------------------------------------------------
+
+original_tf <- run_decoder_validation(sim_seu)
+
+cat("Original TF scores computed.\n")
+
+# ------------------------------------------------------------
+# 5. Positive-control simulation
+# ------------------------------------------------------------
+
+expr_mat <- GetAssayData(sim_seu, layer = "counts")
+sim_expr <- expr_mat
+
+set.seed(123)
+
+for (tf in simulated_tfs) {
+  
+  tf_targets <- dorothea_hs %>%
+    dplyr::filter(tf == !!tf) %>%
+    dplyr::pull(target)
+  
+  tf_targets <- intersect(tf_targets, rownames(sim_expr))
+  
+  if (length(tf_targets) < 10) next
+  
+  selected_targets <- sample(tf_targets, min(20, length(tf_targets)))
+  selected_cells <- sample(colnames(sim_expr), floor(0.3 * ncol(sim_expr)))
+  
+  sim_expr[selected_targets, selected_cells] <- 0
+  
+  cat("Simulated discordance for:", tf, "\n")
+}
+
+sim_seu_perturbed <- CreateSeuratObject(counts = sim_expr)
+
+perturbed_tf <- run_decoder_validation(sim_seu_perturbed)
+
+# ------------------------------------------------------------
+# 6. Negative-control (random perturbation) — FROM SAME COUNTS
+# ------------------------------------------------------------
+
+set.seed(456)
+
+random_expr <- expr_mat   # same background counts
+
+random_genes <- sample(rownames(random_expr), 500)
+random_cells <- sample(colnames(random_expr), floor(0.3 * ncol(random_expr)))
+
+random_expr[random_genes, random_cells] <- 0
+
+cat("Random perturbation completed\n")
+
+random_seu <- CreateSeuratObject(counts = random_expr)
+
+random_tf <- run_decoder_validation(random_seu)
+
+# ------------------------------------------------------------
+# 7. Noise robustness
+# ------------------------------------------------------------
+
+set.seed(789)
+
+noise_tf <- original_tf
+noise_tf$discordance_score <- noise_tf$discordance_score +
+  rnorm(nrow(noise_tf), mean = 0, sd = 0.01)
+
+noise_tf$discordance_score[noise_tf$discordance_score < 0] <- 0
+
+rho <- cor(original_tf$discordance_score,
+           noise_tf$discordance_score,
+           method = "spearman")
+
+# ------------------------------------------------------------
+# 8. plot_df for Panel A
+# ------------------------------------------------------------
+
+plot_df <- data.frame(
+  tf = simulated_tfs,
+  original = original_tf$discordance_score[match(simulated_tfs, original_tf$tf)],
+  perturbed = perturbed_tf$discordance_score[match(simulated_tfs, perturbed_tf$tf)]
+)
+
+plot_df$improvement <- plot_df$perturbed - plot_df$original
+plot_df <- plot_df[order(plot_df$improvement), ]
+
+# ------------------------------------------------------------
+# 9. Panel A: Positive-control rewiring
+# ------------------------------------------------------------
+
+p1 <- ggplot(plot_df, aes(x = improvement, y = reorder(tf, improvement))) +
+  geom_segment(aes(x = 0, xend = improvement, y = tf, yend = tf),
+               linewidth = 2, color = "skyblue3") +
+  geom_point(size = 6, color = "tomato") +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "A. Positive-control rewiring",
+    x = "Regulatory discordance increase",
+    y = "Simulated TFs"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ------------------------------------------------------------
+# 10. Panel B: Random perturbation control
+# ------------------------------------------------------------
+
+spec_df <- data.frame(
+  group = c("Original", "Random perturbation"),
+  score = c(
+    mean(original_tf$discordance_score),
+    mean(random_tf$discordance_score)
+  )
+)
+
+print(spec_df)  # ← Check values here
+
+p2 <- ggplot(spec_df, aes(x = group, y = score, fill = group)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = "B. Random perturbation control",
+    x = "",
+    y = "Mean discordance"
+  ) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"))
+
+# ------------------------------------------------------------
+# 11. Panel C: Noise robustness
+# ------------------------------------------------------------
+
+robust_df <- data.frame(
+  original = original_tf$discordance_score,
+  noisy = noise_tf$discordance_score
+)
+
+p3 <- ggplot(robust_df, aes(x = original, y = noisy)) +
+  geom_point(alpha = 0.6, color = "darkgreen", size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  theme_classic(base_size = 14) +
+  labs(
+    title = paste0("C. Noise robustness (ρ = ", round(rho, 3), ")"),
+    x = "Original discordance",
+    y = "Noisy discordance"
+  ) +
+  theme(plot.title = element_text(face = "bold"))
+
+# ------------------------------------------------------------
+# 12. Combine and save
+# ------------------------------------------------------------
+
+combined_simulation <- (p1 | p2 | p3)
+
+print(combined_simulation)
+
+ggsave(
+  "Figure_Combined_Simulation_Validation.png",
+  combined_simulation,
+  width = 16,
+  height = 5,
+  dpi = 1000,
+  bg = "white"
+)
